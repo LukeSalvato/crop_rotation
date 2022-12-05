@@ -1,0 +1,427 @@
+---
+title: "tidy_model_repetition_VIP"
+author: "Luke Salvato"
+date: '2022-09-09'
+output: html_document
+---
+
+```{r load packages}
+library(spatialRF)
+library(kableExtra)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(randomForestExplainer)
+library(pdp)
+library(sf)
+library(tidymodels)
+library(usemodels)
+library(themis)
+library(tidyverse)
+```
+
+```{r load data}
+soil <- st_read("/Users/lukesalvato/Dropbox/Mac (3)/Documents/Land_Use/soils/data/categorial_and_numeric_soil_data_at_field_level_20220413.geojson") %>%
+  st_as_sf()
+
+
+```
+
+```{r change detection}
+soil_count <- soil %>% 
+    mutate(x = unlist(map(soil$geometry,1)),
+           y = unlist(map(soil$geometry,2)))%>% 
+  #st_drop_geometry() %>% 
+  #as_tibble() %>%
+  pivot_longer(crop_2007_name:crop_2021_name, values_to="Crop", names_to = "year") %>%
+  mutate(year = gsub("crop_", "", year)) %>%
+  mutate(year = gsub("_name", "", year)) %>% 
+  mutate(rice = case_when(Crop == "rice" ~ 1, Crop != "rice" ~0)) %>% 
+  pivot_wider(names_from = year, values_from = c(Crop, rice)) %>% 
+  unite(string, "rice_2007":"rice_2021", sep = "", remove = TRUE, na.rm = TRUE) %>% 
+  filter(string != "00000000000000") %>% #incase there are still any fields that were never in rice, there shouldn't be
+  filter(string != "") %>% # for some reason had one blank string, so removed that. Now down to 12,375 fields
+  mutate(rotations = as.character(str_count(string, "10"))) %>% 
+  pivot_longer(Crop_2007:Crop_2021, values_to = "Crop", names_to = "year") %>% 
+  mutate(year = gsub("Crop_", "", year)) %>% 
+  mutate(Rice = case_when(Crop == "rice" ~ 1, Crop != "rice" ~ 0)) %>% 
+  mutate(rice_or_fallow = case_when(Crop %in% c("rice", "fallow") ~ 1, TRUE~0)) %>% 
+  mutate(Fallow = case_when(Crop == "fallow" ~ 1, Crop != "fallow" ~0)) %>%
+  mutate(Annual = case_when(Crop %in% c("annual crop", "other annual", "alfalfa") ~ 1,
+ Crop != c("annual crop", "other annual", "alfalfa") ~ 0)) %>% 
+   group_by(OBJECTID_1) %>%
+ mutate(rice_count = sum(Rice), annual_count = sum(Annual), rice_or_fallow_count = sum(rice_or_fallow)) %>% 
+  ungroup() %>% 
+  dplyr::select(-c(Rice, Fallow,rice_or_fallow, Annual)) %>% 
+  pivot_wider(names_from = year, values_from = Crop) %>%
+  mutate(reshard = as.character(reshard),
+         reskind = as.character(reskind)) %>% 
+replace_na(list( reshard = "none", reskind = "none")) %>% 
+mutate(reshard = as.factor(reshard),
+       reskind = as.factor(reskind)) %>% 
+mutate(cemented_layer = case_when(reshard %in% c("Indurated", "Very strongly cemented", "Strongly cemented") ~ "strongly cemented",
+                                  reshard %in% c("Moderately cemented", "Weakly cemented", "Very weakly cemented", "Extremely weakly cemented")~ "weakly cemented",
+                                  reshard %in% c("Noncemented", "none") ~ "none")) %>% 
+  mutate(cemented_layer = as_factor(cemented_layer)) %>% 
+  mutate(ksat_dum = case_when(ksat.r_mean < 0.2 ~ "low",
+                              TRUE ~ "high")) %>% 
+  mutate(ksat_dum = as.factor(ksat_dum))
+
+```
+
+```{r classes}
+soil_count_rice_rotated <- soil_count %>% 
+  mutate(class = case_when(rice_count < 12 & rice_count >= 7 & rotations >= 2 & annual_count >=2 ~ "rice_rotated_field",
+                           rice_count >= 12 & rice_or_fallow_count == 15 ~ "rice_field",
+                           ))
+
+# could play w these numbers -----     
+#soil_count_rice_rotated %>% group_by(class) %>% tally()
+#soil_count_rice_rotated %>% group_by(class) %>% summarise(acres = sum(acres))
+```
+
+
+
+```{r df}
+#make it  data.frame, and remove NAs
+df <- soil_count_rice_rotated %>% as.data.frame() %>% #drop_na(class) %>% 
+  dplyr::select(class, ph, irrcapcl, ec, sar, ksat.r_mean, taxorder, acres, x, y, geometry, cec, om, restrictive_layer, clay) %>% 
+#select(predictor.variable.names, class, x, y) %>% 
+  mutate(class = as.factor(class)) %>%
+ # mutate(class = case_when(class == "rice_field" ~ 0,
+  #                                 class == "rice_rotated_field" ~ 1)) %>% 
+  mutate(irrcapcl = as.numeric(irrcapcl)) %>% 
+  na.omit() %>%  #%>% #slice_sample(n = 1000) %>% 
+mutate(class = factor(class, levels = c("rice_rotated_field", "rice_field")))
+
+table(df$class)  
+#7294/463 = 15.75
+#463/7249*100 6% of the area is rotated field!!! I think?
+
+
+df %>% group_by(class) %>% count()
+df %>% group_by(class) %>% summarise(sum = sum(acres))
+#364323/39457 = ~9
+#39457/364323*100 = 10. So in terms of acreage, rice fields are ~9x more prevalent than rotated fields. Rice field area is 11% of rotated field area.
+
+    #ungroup() %>% 
+#mutate(class_binomial = case_when(class == "rice_field" ~ 0,
+                                   #class == "rice_rotated_field" ~ 1)) #%>% 
+  #mutate(across(.cols = numeric_vars, scale))
+```
+
+```{r resampling}
+library(spatialsample)
+set.seed(123)
+df_split <- initial_split(df, strata = class)#stratified sampling
+
+#df_split
+df_train <- training(df_split) 
+#df_train
+df_test <- testing(df_split)
+#df_test %>% count("NA", ph, sort = TRUE)
+#str(df_train)
+
+#df_train %>% group_by(class) %>% count()
+#df_test %>% group_by(class) %>% count()
+
+#df_folds <- vfold_cv(df_train, strata = class, repeats = 10)
+#df_folds <- bootstraps(df_train, strata = class, repeats = 10)
+#bootstrapping has slightly lower accuracyc for rotation fields, otherwise seems about the same as vfold cv
+
+#spatial cv
+df_folds <- spatial_clustering_cv(df_train, coords = c("x","y"), v = 10)
+```
+
+
+#MODEL
+```{r model}
+#recipee for pree processing and feature engineering (aka get the data ready for modeling)
+mod_form <- class ~ ph + irrcapcl + ec  + sar + ksat.r_mean + taxorder
+
+set.seed(69100)
+ranger_recipe <- 
+  recipe(formula = mod_form, data = df_train) %>% 
+  #step_unknown(all_nominal_predictors()) %>% 
+  #step_corr(all_numeric()) %>% 
+  #step_other(all_nominal_predictors(), threshold =  0.03) %>% #could play with this
+  #step_impute_linear(all_numeric_predictors()) %>%  
+  #step_naomit(skip = TRUE) %>% 
+  #themis::step_downsample(class, skip = TRUE) %>% 
+  #themis::step_rose(class, over_ratio = 0.2, skip = TRUE) %>% 
+  themis::step_upsample(class, over_ratio = 0.2, skip = TRUE) %>% 
+  prep()
+#ranger_recipe  
+
+ranger_boot <- 300
+set.seed(12345)
+
+ranger_recipe_test <- 1:ranger_boot %>% 
+  map(~ recipe(formula = mod_form, data = df_train) %>% 
+  #themis::step_upsample(class, over_ratio = 0.5 ) %>% 
+  #themis::step_downsample(class) %>% 
+    prep())
+
+#create a random forest model specification
+ranger_spec <- #specification
+  rand_forest(
+              mtry = tune(),
+              trees = 90,
+              min_n = tune()
+              ) %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger") 
+
+ranger_workflow <- 
+  workflow() %>% 
+  add_recipe(ranger_recipe) %>% #add feature engineering and model specification to a workflow
+  add_model(ranger_spec)
+
+doParallel::registerDoParallel()
+```
+# TUNE for Fmeas
+```{r}
+set.seed(69100)
+tune_res <- tune_grid(ranger_workflow,
+          resamples = df_folds,
+          metrics =  metric_set(precision, recall, f_meas),
+          grid = 20)
+
+#tune_res %>% collect_metrics()
+tune_res %>% 
+  collect_metrics() %>% 
+  filter(.metric == "f_meas") %>% 
+  select(mean, min_n:mtry) %>% 
+  pivot_longer(min_n:mtry, values_to = "value",
+               names_to = "parameter") %>% 
+  ggplot(aes(value, mean, color = parameter))+
+  geom_point(show.legend = FALSE)+
+  facet_wrap(~parameter, scales = "free_x")
+  
+
+rf_grid <- grid_regular(
+  mtry(range = c(1,6)),
+  min_n(range = c(20,40)),
+  levels = 10
+)
+
+set.seed(420)
+regular_res <- tune_grid(
+  ranger_workflow,
+  metrics =  metric_set(precision, recall, f_meas),
+  resamples = df_folds,
+  grid = rf_grid
+)
+
+regular_res %>% 
+  collect_metrics() %>% 
+  filter(.metric == "f_meas") %>% 
+  mutate(min_n = factor(min_n)) %>% 
+  ggplot(aes(mtry, mean, color = min_n))+
+  geom_line(alpha = 0.5, size = 1.5)+
+  geom_point()
+   
+
+best_f <- select_best(regular_res, "f_meas")
+
+final_rf <- finalize_model(
+  ranger_spec,
+  best_f
+)  
+
+
+
+```
+
+
+```{r}
+final_wf <- workflow() %>% 
+  add_recipe(ranger_recipe) %>% 
+  add_model(final_rf)
+
+final_res <- final_wf %>% #trans final model on training set and evaluates on test set
+  last_fit(df_split, 
+           metrics = metric_set(f_meas, precision, recall))
+
+final_res %>% collect_metrics()
+
+2*(0.61 * 0.65)/(0.61+0.65)
+```
+# FINAL NOTES:
+Grid search between (1:6) ntry
+20:40 for min_n
+Final F-1 score of 0.62
+
+
+
+
+
+
+```{r}
+ranger_tune <- fit_resamples(ranger_workflow, #this model is not actually tuned yet! tho apparently random forest does pretty well wo tunning
+                metrics =  metric_set(roc_auc, j_index
+                 # precision, recall, sens, spec
+                  ),
+                             resamples = df_folds, 
+                #control = ctrl_imp)
+                control = control_resamples(save_pred = TRUE))
+
+collect_metrics(ranger_tune)
+
+```
+
+
+```{r final fitted}
+final_fitted <- last_fit(ranger_workflow, df_split, metrics = metric_set(precision, recall, sens, spec, roc_auc, j_index))
+accuracy <- collect_metrics(final_fitted)
+#pretty good results!
+accuracy %>% 
+  pivot_wider(values_from = .estimate, names_from = .metric) %>% 
+  mutate(F1 = 2*(precision*recall)/(precision+recall))
+
+```
+
+#FIT DATA
+```{r}
+mod_form <- class ~ ph + irrcapcl + ec  + sar + ksat.r_mean + taxorder
+
+set.seed(69100)
+ranger_recipe <- 
+  recipe(formula = mod_form, data = df_train) %>% 
+  #step_unknown(all_nominal_predictors()) %>% 
+  #step_corr(all_numeric()) %>% 
+  #step_other(all_nominal_predictors(), threshold =  0.03) %>% #could play with this
+  #step_impute_linear(all_numeric_predictors()) %>%  
+  #step_naomit(skip = TRUE) %>% 
+  themis::step_downsample(class, skip = TRUE) %>% 
+  #themis::step_rose(class, over_ratio = 0.2, skip = TRUE) %>% 
+ # themis::step_upsample(class, over_ratio = 0.2, skip = TRUE) %>% 
+  prep()
+#ranger_recipe  
+
+
+
+
+#create a random forest model specification
+ranger_spec <- #specification
+  rand_forest(
+              #mtry = tune(),
+              trees = 90,
+              #min_n = tune()
+              ) %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger") 
+
+ranger_workflow <- 
+  workflow() %>% 
+  add_recipe(ranger_recipe) %>% #add feature engineering and model specification to a workflow
+  add_model(ranger_spec)
+
+df_fit <- fit(ranger_workflow, df_train)
+predicted_data <- augment(df_fit, df)
+
+```
+
+```{r}
+predicted_data %>%  filter(class == "rice_field") %>% 
+  filter(between(ec, 0.5,1.5)) %>% 
+  summarise(acres_filt = sum(acres),
+            percent_area = (acres_filt/364323.91)*100,
+            ha = (acres_filt*0.404686),
+           pred_rot_median = median(.pred_rice_rotated_field),
+            pred_rot_mean = mean(.pred_rice_rotated_field))
+
+predicted_data %>%  filter(class == "rice_field") %>% 
+  filter(between(ph, 6.5,8)) %>% 
+  summarise(acres_filt = sum(acres),
+            percent_area = (acres_filt/364323.91)*100,
+            ha = (acres_filt*0.404686),
+            pred_rot_median = median(.pred_rice_rotated_field),
+            pred_rot_mean = mean(.pred_rice_rotated_field))
+
+predicted_data %>%  filter(class == "rice_field") %>% 
+  filter(ksat.r_mean > 2) %>% 
+  summarise(acres_filt = sum(acres),
+            percent_area = (acres_filt/364323.91)*100,
+            ha = (acres_filt*0.404686),
+            pred_rot_median = median(.pred_rice_rotated_field),
+            pred_rot_mean = mean(.pred_rice_rotated_field))
+
+
+```
+
+
+```{r}
+predicted_data %>%  filter(class == "rice_field") %>% 
+  #filter(ksat.r_mean > 2) %>% 
+    filter(between(ec, 0.5,1.5)) %>% 
+    filter(between(ph, 6.5,8)) %>% 
+  summarise(acres_filt = sum(acres),
+            percent_area = (acres_filt/364323.91)*100,
+            ha = (acres_filt*0.404686),
+            pred_rot_median = median(.pred_rice_rotated_field),
+            pred_rot_mean = mean(.pred_rice_rotated_field))
+```
+
+
+
+
+
+Based on F1 score, upsampling seems better than down sampling
+
+prec        recall    F1
+0.9758621	0.930411	0.9525947 Upsample 1 
+0.976177	0.9430137	0.9593088 Upsample 0.5
+
+0.9718232	0.9638356	0.9678129 Upsample 0.2
+
+0.9823455	0.8536986	0.9135151 Downsample - still decent but not as good as the upsampling
+
+
+#using rose we get the highest J-score of 0.63, but F1 score is quite low (0.3). 
+
+
+
+TRAIN MODEL ON UNDER OR OVER SAMPLE, THEN TEST ON NORMAL SAMPLE is one way to do this
+Also could consider training on the entire data set (up or down sampled) and then testing on some portion of it
+
+great explanation of class imbalance and precision/recall here:
+https://towardsdatascience.com/random-forest-for-imbalanced-dataset-example-with-avalanches-in-french-alps-77ffa582f68b
+
+
+
+#PREDICTIONS
+```{r}
+collect_predictions(final_fitted) %>% 
+  conf_mat(class, .pred_class)
+#this is still not great at predicting rotated fields, but it is better with upsampling than with downsampling
+#also, overall model performance is better with upsampling.
+
+collect_predictions(ranger_tune) %>% 
+  conf_mat(class, .pred_class)
+
+```
+
+#Manually compute sens and spec
+This is done of final_fitted
+```{r}
+#sens = true pos / (true pos + false neg)
+1695/(1695+130)
+#Down sample: 1513/(1513+312)
+
+#spec = true neg /(true neg + false pos)
+71/(71+44)
+#down sample: 
+
+
+#weighted F1 example
+rot_f1 <- 0.57
+rice_f1 <- 0.96
+(rot_f1*463+rice_f1*7294)/(463+7294)
+#weighted F1 = 0.937
+
+#Baseline model example
+2*(0.4*1)/(0.4+1) #upsample
+2*(0.267*1)/(0.267+1)#downsample
+#both of these baseline F1's are about the same as the model's actual F1
+```
+
