@@ -8,7 +8,7 @@
 
 [![](variable_importance_plot_20220923.png)
 
-[![](pdp_plot_20221202_EDIT.png)]
+[![](pdp_plot_20221202_EDIT.png)
 
 [![](3_panel_map_multi_legend.png)
 
