@@ -2,12 +2,9 @@
 ### Landsat land cover data + SSURGO Soil data + Random Forest modeling  
 
 
-
-  
-  
   
 ![](variable_importance_plot_20220923.png)  
-Variable importance (VI) scores for the soil variables used in the random forest model after 200 iterations. The violin plot shows the distribution of the 200 VI scores, the left and right side of the box are the upper and lower quartiles, the vertical line inside the box is the median, and the whiskers extend to 1.5 times the interquartile range. The red dot shows the VI score from the initial model execution.  
+Variable importance (VI) scores for the soil variables used in the random forest model after 200 bootstraps. The violin plot shows the distribution of the 200 VI scores, the left and right side of the box are the upper and lower quartiles, the vertical line inside the box is the median, and the whiskers extend to 1.5 times the interquartile range. The red dot shows the VI score from the initial model execution.  
   
   
   
