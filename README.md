@@ -3,7 +3,7 @@
 
 Most of California's Sacramento Valley has been in continuous rice production for decades. While this region maintain high yields, it is under threat from increasing pest and weed pressure, and widespread water restrictions. Crop rotation is one potential method to mitigate these issues, but but this region also has some extremely harsh soil types, making it difficult to grow non-flooded crops.  
   
-We used land cover information, soil data, and a binomial classification modeling approach to examine the suitability of the region for non-flooded crops. According to this approach, not a whole lot of the region could accommodate non flooded annual crops.
+We used land cover information, soil data, and a maachine learning framework to examine the suitability of the region for non-flooded crops.
    
    
 ![](variable_importance_plot_20220923.png)  
